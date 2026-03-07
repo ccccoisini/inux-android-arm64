@@ -138,7 +138,7 @@ enum bp_type
     BP_WRITE,      // 写
     BP_READ_WRITE, // 读写
     BP_EXECUTE     // 执行
-};
+} __attribute__((packed));
 
 // 断点作用线程范围
 enum bp_scope
@@ -146,7 +146,7 @@ enum bp_scope
     SCOPE_MAIN_THREAD,   // 仅主线程
     SCOPE_OTHER_THREADS, // 仅其他子线程
     SCOPE_ALL_THREADS    // 全部线程
-};
+} __attribute__((packed));
 
 // 记录单个 PC（触发指令地址）的命中状态
 struct hwbp_record
@@ -159,7 +159,7 @@ struct hwbp_record
     uint64_t orig_x0;   // 原始 X0
     uint64_t syscallno; // 系统调用号
     uint64_t pstate;    // 处理器状态
-};
+} __attribute__((packed));
 
 // 存储整体命中信息
 struct hwbp_info
@@ -171,7 +171,7 @@ struct hwbp_info
     // 记录不同 PC 触发状态的数组
     struct hwbp_record records[0x100];
     int record_count; // 当前已记录的不同 PC 数量
-};
+} __attribute__((packed));
 
 // 链表节点，用于保存注册的 perf_event 指针，方便后续删除
 struct bp_node

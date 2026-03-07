@@ -18,24 +18,24 @@
 
 enum sm_req_op
 {
-	op_o = 0, // 空调用
-	op_r = 1,
-	op_w = 2,
-	op_m = 3, // 获取进程内存信息
+	op_o, // 空调用
+	op_r,
+	op_w,
+	op_m, // 获取进程内存信息
 
-	op_down = 4,
-	op_move = 5,
-	op_up = 6,
-	op_init_touch = 50, // 初始化触摸
-	op_del_touch = 60,	// 清理触摸触摸
+	op_down,
+	op_move,
+	op_up,
+	op_init_touch, // 初始化触摸
+	op_del_touch,  // 清理触摸触摸
 
-	op_brps_weps_info = 7,		// 获取执行断点数量和访问断点数量
-	op_set_process_hwbp = 8,	// 设置硬件断点
-	op_remove_process_hwbp = 9, // 删除硬件断点
+	op_brps_weps_info,		// 获取执行断点数量和访问断点数量
+	op_set_process_hwbp,	// 设置硬件断点
+	op_remove_process_hwbp, // 删除硬件断点
 
-	exit = 100,
-	kexit = 200
-};
+	exit,
+	kexit
+} __attribute__((packed));
 
 #include "virtual_input.h" //在这里预处理展开，方便使用req_op
 
@@ -67,7 +67,7 @@ struct req_obj
 	int POSITION_X, POSITION_Y;
 	// 触摸坐标
 	int x, y;
-};
+} __attribute__((packed));
 
 static struct req_obj *req = NULL;
 
@@ -311,7 +311,7 @@ static int __init lsdriver_init(void)
 
 	hide_myself(); // 隐藏内核模块本身
 
-	// allocate_physical_page_info();//pte读写需要，线性读写不需要 // 初始化物理页地址和页表项
+	allocate_physical_page_info(); // pte读写需要，线性读写不需要 // 初始化物理页地址和页表项
 
 	chf = kthread_run(ConnectThreadFunction, NULL, "C_thread");
 	if (IS_ERR(chf))

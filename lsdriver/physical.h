@@ -23,7 +23,7 @@
 #include <linux/sort.h>
 #include "ExportFun.h"
 
-// ↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓方案1:PTE读写 ↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
+//============方案1:PTE读写+MMU硬件翻译地址============
 struct physical_page_info
 {
     void *base_address;
@@ -135,7 +135,6 @@ err_out:
     vfree((void *)vaddr);
     return -EFAULT;
 }
-
 // 释放
 static inline void free_physical_page_info(void)
 {
@@ -148,20 +147,21 @@ static inline void free_physical_page_info(void)
 }
 
 // 通过直接操作PTE，从指定的任意物理地址读取数据。
-static inline void _internal_read_fast(phys_addr_t paddr, void *buffer, size_t size)
+static inline int _internal_read_fast(phys_addr_t paddr, void *buffer, size_t size)
 {
     // MT_NORMAL_NC无缓存只读(建议用缓存MT_NORMAL因为cpu来不及把进程数据缓存写入内存，就直接读物理会有意外如：在1000000次测试下发现数据不匹配就是应为缓存没及时写入内存)
     static const uint64_t FLAGS = PTE_TYPE_PAGE | PTE_VALID | PTE_AF | PTE_SHARED | PTE_PXN | PTE_UXN | PTE_ATTRINDX(MT_NORMAL);
+    // 注意:这个缓存指的是硬件TLB缓存和硬件L1-L3级缓存
 
     uint64_t pfn;
     if (unlikely(!size || !buffer))
-        return;
+        return -EINVAL;
 
     pfn = __phys_to_pfn(paddr);
 
     // PFN 有效性检查：确保物理页帧在系统内存管理范围内
     if (unlikely(!pfn_valid(pfn)))
-        return;
+        return -EFAULT;
 
     // 直接修改 PTE 指向目标物理页
     set_pte(info.pte_address, pfn_pte(pfn, __pgprot(FLAGS)));
@@ -172,12 +172,13 @@ static inline void _internal_read_fast(phys_addr_t paddr, void *buffer, size_t s
     // 刷新 TLB (只刷新单个页);
     flush_tlb_kernel_range((uint64_t)info.base_address, (uint64_t)info.base_address + PAGE_SIZE);
     // flush_tlb_all();//刷新全部cpu核心TLB
+
     // isb(); // 刷新流水线，确保后续读取使用新的映射
 
     /*
     拷贝数据(这里没用likely检查字节对齐极端情况会导致：)
     1.地址正好跨越了缓存行的边界（比如一个 float 一半在 Cache Line A，一半在 Cache Line B），CPU 必须发起两次总线事务。
-        在这两次读取的间隙，用户态程序正好改写了这个值。你读到的就是“前半截是新值，后半截是旧值”的撕裂数据
+        在这两次读取的间隙，用户态程序正好改写了这个值。你读到的就是"前半截是新值，后半截是旧值"的撕裂数据
     2.使用 __attribute__((packed)) 的结构体强行紧凑布局和不对齐导致
     */
     switch (size)
@@ -206,18 +207,20 @@ static inline void _internal_read_fast(phys_addr_t paddr, void *buffer, size_t s
         memcpy(buffer, (char *)info.base_address + (paddr & ~PAGE_MASK), size);
         break;
     }
+
+    return 0;
 }
-static inline void _internal_write_fast(phys_addr_t paddr, const void *buffer, size_t size)
+static inline int _internal_write_fast(phys_addr_t paddr, const void *buffer, size_t size)
 {
     static const uint64_t FLAGS = PTE_TYPE_PAGE | PTE_VALID | PTE_AF | PTE_SHARED | PTE_WRITE | PTE_PXN | PTE_UXN | PTE_ATTRINDX(MT_NORMAL);
     uint64_t pfn;
     if (unlikely(!size || !buffer))
-        return;
+        return -EINVAL;
 
     pfn = __phys_to_pfn(paddr);
 
     if (unlikely(!pfn_valid(pfn)))
-        return;
+        return -EFAULT;
 
     set_pte(info.pte_address, pfn_pte(pfn, __pgprot(FLAGS)));
     flush_tlb_kernel_range((uint64_t)info.base_address, (uint64_t)info.base_address + PAGE_SIZE);
@@ -248,18 +251,102 @@ static inline void _internal_write_fast(phys_addr_t paddr, const void *buffer, s
         memcpy((char *)info.base_address + (paddr & ~PAGE_MASK), buffer, size);
         break;
     }
+
+    return 0;
+}
+// 硬件mmu翻译
+static inline int translate_user_va_to_pa(struct mm_struct *mm, u64 va, phys_addr_t *pa)
+{
+    u64 pgd_phys;
+    int ret;
+    u64 phys_out;
+
+    // 替代硬编码 x10-x13寄存器
+    u64 tmp_daif, tmp_ttbr, tmp_par, tmp_offset;
+
+    if (unlikely(!mm || !mm->pgd || !pa))
+        return -EINVAL;
+
+    pgd_phys = virt_to_phys(mm->pgd);
+
+    asm volatile(
+        //  保存当前中断状态并关中断，防止抢占
+        "mrs    %[tmp_daif], daif\n"
+        "msr    daifset, #2\n"
+
+        // // 临时把 ttbr0_el1 改为pgd_phys，为了后续at指令翻译需要的页表基址 (此时 ASID 为 0)
+        "mrs    %[tmp_ttbr], ttbr0_el1\n"
+        "msr    ttbr0_el1, %[pgd_phys]\n"
+        "isb\n"
+
+        //  硬件翻译指令
+        "at     s1e0r, %[va]\n"
+        "isb\n"
+        "mrs    %[tmp_par], par_el1\n"
+
+        // 清除 ASID 0 的 TLB 污染！
+        // 因为刚刚的 at 指令可能会将 ASID=0 的翻译结果缓存进 TLB
+        // 如果不清理，会导致系统关键进程命中错误的 TLB 从而引发软重启
+        "lsr    %[tmp_offset], %[va], #12\n" // 右移 12 位，构造 TLBI 需要的 VPN 格式
+        "tlbi   vale1, %[tmp_offset]\n"      // 使当前 CPU 的该 VA (ASID=0) 的 TLB 失效
+        "dsb    nsh\n"                       // 确保本地 TLB 清理完成
+
+        // 恢复原来的页表和中断
+        "msr    ttbr0_el1, %[tmp_ttbr]\n"
+        "isb\n"
+        "msr    daif, %[tmp_daif]\n"
+
+        // 检查翻译是否报错 (PAR_EL1 的 bit 0)
+        "tbnz   %[tmp_par], #0, .L_efault%=\n"
+
+        // 计算物理地址
+        "and    %[tmp_par], %[tmp_par], #0xFFFFFFFFF000\n"
+        "and    %[tmp_offset], %[va], #0xFFF\n"
+        "orr    %[phys_out], %[tmp_par], %[tmp_offset]\n"
+
+        // 成功返回 0
+        "mov    %w[ret], #0\n"
+        "b      .L_end%=\n"
+
+        // 错误处理分支
+        ".L_efault%=:\n"
+        "mov    %w[ret], %w[efault_val]\n"
+
+        ".L_end%=:\n"
+
+        // 输出部分
+        : [ret] "=&r"(ret),
+          [phys_out] "=&r"(phys_out),
+          [tmp_daif] "=&r"(tmp_daif),
+          [tmp_ttbr] "=&r"(tmp_ttbr),
+          [tmp_par] "=&r"(tmp_par),
+          [tmp_offset] "=&r"(tmp_offset)
+
+        // 输入部分
+        : [pgd_phys] "r"(pgd_phys),
+          [va] "r"(va),
+          [efault_val] "r"(-EFAULT)
+
+        // Clobber
+        : "cc", "memory");
+    // 把写入内存的工作交回给 C 语言，编译器会生成最优的指令
+    if (ret == 0)
+    {
+        *pa = phys_out;
+    }
+
+    return ret;
 }
 
-// ↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓方案2:内核已经映射的线性地址读写↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
+//============方案2:内核已经映射的线性地址读写+手动走页表翻译地址============
 static inline int _internal_read_fast_linear(phys_addr_t paddr, void *buffer, size_t size)
 {
 
     // 直接数学转换 在 ARM64 上，这通常等价于: (void*)(paddr + PAGE_OFFSET)
     void *kernel_vaddr = phys_to_virt(paddr);
-
     /*
     这里去掉了 virt_addr_valid。在 ARM64 上，它由于要遍历内存节点，耗极高。
-    在查页表时统一拦截：把安全校验提前到了 MMU 翻译阶段，
+    在查页表时统一拦截：把安全校验提前到了翻译阶段，
     只要返回物理地址就是合理有效的
     */
 
@@ -286,9 +373,7 @@ static inline int _internal_read_fast_linear(phys_addr_t paddr, void *buffer, si
 }
 static inline int _internal_write_fast_linear(phys_addr_t paddr, void *buffer, size_t size)
 {
-
     void *kernel_vaddr = phys_to_virt(paddr);
-
     // 写入操作
     switch (size)
     {
@@ -310,7 +395,6 @@ static inline int _internal_write_fast_linear(phys_addr_t paddr, void *buffer, s
     }
     return 0;
 }
-
 // 手动走页表翻译（不再禁止中断，靠每级安全检查防护）
 static inline int manual_va_to_pa_arm_fast(struct mm_struct *mm, uint64_t vaddr, phys_addr_t *paddr)
 {
@@ -396,90 +480,6 @@ static inline int manual_va_to_pa_arm_fast(struct mm_struct *mm, uint64_t vaddr,
     return -1;
 }
 
-// 硬件mmu翻译
-static inline int translate_user_va_to_pa(struct mm_struct *mm, u64 va, phys_addr_t *pa)
-{
-    u64 pgd_phys;
-    int ret;
-    u64 phys_out;
-
-    // 替代硬编码 x10-x13寄存器
-    u64 tmp_daif, tmp_ttbr, tmp_par, tmp_offset;
-
-    if (unlikely(!mm || !mm->pgd || !pa))
-        return -EINVAL;
-
-    pgd_phys = virt_to_phys(mm->pgd);
-
-    asm volatile(
-        //  保存当前中断状态并关中断，防止抢占
-        "mrs    %[tmp_daif], daif\n"
-        "msr    daifset, #2\n"
-
-        // // 临时把 ttbr0_el1 改为pgd_phys，为了后续at指令翻译需要的页表基址 (此时 ASID 为 0)
-        "mrs    %[tmp_ttbr], ttbr0_el1\n"
-        "msr    ttbr0_el1, %[pgd_phys]\n"
-        "isb\n"
-
-        //  硬件翻译指令
-        "at     s1e0r, %[va]\n"
-        "isb\n"
-        "mrs    %[tmp_par], par_el1\n"
-
-        // 清除 ASID 0 的 TLB 污染！
-        // 因为刚刚的 at 指令可能会将 ASID=0 的翻译结果缓存进 TLB
-        // 如果不清理，会导致系统关键进程命中错误的 TLB 从而引发软重启
-        "lsr    %[tmp_offset], %[va], #12\n" // 右移 12 位，构造 TLBI 需要的 VPN 格式
-        "tlbi   vale1, %[tmp_offset]\n"      // 使当前 CPU 的该 VA (ASID=0) 的 TLB 失效
-        "dsb    nsh\n"                       // 确保本地 TLB 清理完成
-
-        // 恢复原来的页表和中断
-        "msr    ttbr0_el1, %[tmp_ttbr]\n"
-        "isb\n"
-        "msr    daif, %[tmp_daif]\n"
-
-        // 检查翻译是否报错 (PAR_EL1 的 bit 0)
-        "tbnz   %[tmp_par], #0, .L_efault%=\n"
-
-        // 计算物理地址
-        "and    %[tmp_par], %[tmp_par], #0xFFFFFFFFF000\n"
-        "and    %[tmp_offset], %[va], #0xFFF\n"
-        "orr    %[phys_out], %[tmp_par], %[tmp_offset]\n"
-
-        // 成功返回 0
-        "mov    %w[ret], #0\n"
-        "b      .L_end%=\n"
-
-        // 错误处理分支
-        ".L_efault%=:\n"
-        "mov    %w[ret], %w[efault_val]\n"
-
-        ".L_end%=:\n"
-
-        // 输出部分
-        : [ret] "=&r"(ret),
-          [phys_out] "=&r"(phys_out),
-          [tmp_daif] "=&r"(tmp_daif),
-          [tmp_ttbr] "=&r"(tmp_ttbr),
-          [tmp_par] "=&r"(tmp_par),
-          [tmp_offset] "=&r"(tmp_offset)
-
-        // 输入部分
-        : [pgd_phys] "r"(pgd_phys),
-          [va] "r"(va),
-          [efault_val] "r"(-EFAULT)
-
-        // Clobber
-        : "cc", "memory");
-    // 把写入内存的工作交回给 C 语言，编译器会生成最优的指令
-    if (ret == 0)
-    {
-        *pa = phys_out;
-    }
-
-    return ret;
-}
-
 static inline int read_process_memory(pid_t pid, uint64_t vaddr, void *buffer, size_t size)
 {
     // 使用 static 缓存 mm
@@ -546,7 +546,7 @@ static inline int read_process_memory(pid_t pid, uint64_t vaddr, void *buffer, s
         }
         else
         {
-            // MMU翻译地址
+            // 翻译地址
             status = translate_user_va_to_pa(s_last_mm, current_vpn, &paddr_of_page);
             if (unlikely(status != 0))
             {
@@ -561,7 +561,7 @@ static inline int read_process_memory(pid_t pid, uint64_t vaddr, void *buffer, s
         }
 
         // 执行物理内存读取
-        status = _internal_read_fast_linear(paddr_of_page + page_offset, (char *)buffer + bytes_copied, bytes_to_read_this_page);
+        status = _internal_read_fast(paddr_of_page + page_offset, (char *)buffer + bytes_copied, bytes_to_read_this_page);
 
         if (unlikely(status != 0))
         {
@@ -586,7 +586,6 @@ static inline int read_process_memory(pid_t pid, uint64_t vaddr, void *buffer, s
 
     return 0;
 }
-
 static inline int write_process_memory(pid_t pid, uint64_t vaddr, void *buffer, size_t size)
 {
     // 使用 static 缓存 mm
@@ -659,7 +658,7 @@ static inline int write_process_memory(pid_t pid, uint64_t vaddr, void *buffer, 
             loop_last_ppage_base = paddr_of_page;
         }
 
-        status = _internal_write_fast_linear(paddr_of_page + page_offset, (char *)buffer + bytes_copied, bytes_to_read_this_page);
+        status = _internal_write_fast(paddr_of_page + page_offset, (char *)buffer + bytes_copied, bytes_to_read_this_page);
         if (unlikely(status != 0))
         {
 
@@ -752,30 +751,29 @@ struct segment_info
     uint8_t prot; // 区段权限: 1(R), 2(W), 4(X)。例如 RX 就是 5 (1+4)
     uint64_t start;
     uint64_t end;
-};
+} __attribute__((packed));
 
 struct module_info
 {
     char name[MOD_NAME_LEN];
     int seg_count;
     struct segment_info segs[MAX_SEGS_PER_MODULE];
-};
+} __attribute__((packed));
 
 struct region_info
 {
     uint64_t start;
     uint64_t end;
-};
+} __attribute__((packed));
 
 struct memory_info
 {
-
     int module_count;                        // 总模块数量
     struct module_info modules[MAX_MODULES]; // 模块信息
 
     int region_count;                             // 总可扫描内存数量
     struct region_info regions[MAX_SCAN_REGIONS]; // 可扫描内存区域 (rw-p, 排除特殊区域)
-};
+} __attribute__((packed));
 
 static int find_or_add_module(struct module_info *modules, int *module_count, const char *name)
 {
@@ -1058,7 +1056,8 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
 
         if (m->seg_count > 0)
         {
-            /* --- 纯物理地址排序  --- */
+            /* --- 1. 纯物理地址排序 --- */
+            // 应对极端的反作弊内核级乱序映射干扰
             for (int x = 1; x < m->seg_count; x++)
             {
                 struct segment_info key = m->segs[x];
@@ -1072,7 +1071,7 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
                 m->segs[y + 1] = key;
             }
 
-            /* --- 聚类算法 --- */
+            /* --- 2. 改进版体积聚类 (寻找生命主干) --- */
             uint64_t current_base = m->segs[0].start;
             uint64_t current_end = m->segs[0].end;
             uint64_t current_volume = m->segs[0].end - m->segs[0].start;
@@ -1083,8 +1082,8 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
 
             for (j = 1; j < m->seg_count; j++)
             {
-                // 由于 ARM64 架构指令寻址的限制, 超过 16MB 断层视为不同群落
-                if (m->segs[j].start - current_end > 0x1000000)
+                // 增加 start >= current_end，防止反作弊恶意的错位映射引发的 uint64_t 无符号下溢出
+                if (m->segs[j].start >= current_end && (m->segs[j].start - current_end > 0x1000000))
                 {
                     // 结算上一个群落，看是不是体积最大的（真正的 so 本体）
                     if (current_volume > max_volume)
@@ -1100,10 +1099,13 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
                 }
                 else
                 {
-                    // 群落延续，拓展边界并累加真实体积
+                    // 严谨计算增量体积。防止反作弊在同一区域内疯狂套娃重叠映射，导致体积翻倍虚高
                     if (m->segs[j].end > current_end)
+                    {
+                        uint64_t increment_start = (m->segs[j].start > current_end) ? m->segs[j].start : current_end;
+                        current_volume += (m->segs[j].end - increment_start);
                         current_end = m->segs[j].end;
-                    current_volume += (m->segs[j].end - m->segs[j].start);
+                    }
                 }
             }
             // 结算最后一个群落
@@ -1113,7 +1115,7 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
                 best_end = current_end;
             }
 
-            /* ---物理抹杀假诱饵  --- */
+            /* --- 3. 物理抹杀假诱饵 --- */
             int valid_count = 0;
             for (j = 0; j < m->seg_count; j++)
             {
@@ -1124,7 +1126,10 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
             }
             m->seg_count = valid_count;
 
-            /* ---  严谨拓扑标记 --- */
+            if (m->seg_count == 0)
+                continue;
+
+            /* --- 4. 严谨拓扑标记 --- */
             int first_data_idx = -1;
 
             // 寻找天然的数据段边界 (纯 RW 段，防跨界吞噬)
@@ -1166,7 +1171,7 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
                 }
                 else if (first_data_idx != -1 && j < first_data_idx)
                 {
-                    // 在 Header 和第一个 Data 段之间的所有碎片  全部强制判定为核心代码段
+                    // 在 Header 和第一个 Data 段之间的所有碎片 全部强制判定为核心代码段
                     m->segs[j].index = 0;
                 }
                 else
@@ -1187,7 +1192,7 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
                 }
             }
 
-            /* --- 拉链式精准缝合 --- */
+            /* --- 5. 拉链式精准缝合 --- */
             int out_idx = 0;
             for (j = 1; j < m->seg_count; j++)
             {
@@ -1202,12 +1207,17 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
                 else
                 {
                     out_idx++;
-                    m->segs[out_idx] = *curr;
+                    // 避免不必要的自我覆盖
+                    if (out_idx != j)
+                    {
+                        m->segs[out_idx] = *curr;
+                    }
                 }
             }
             m->seg_count = out_idx + 1;
+
+            /* --- 6. 最终 Index 序列化 --- */
             seq = 0;
-            /* --- 最终 Index 序列化  --- */
             for (j = 0; j < m->seg_count; j++)
             {
                 if (m->segs[j].index != -1) // 保持 BSS 的 -1 标识不变
@@ -1217,6 +1227,7 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
             }
         }
     }
+
     mmput(mm);
     put_task_struct(task);
     kfree(path_buf);

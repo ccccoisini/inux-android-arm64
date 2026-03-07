@@ -238,30 +238,29 @@ public: // 外部获取内存信息
         uint8_t prot; // 区段权限: 1(R), 2(W), 4(X)。例如 RX 就是 5 (1+4)
         uint64_t start;
         uint64_t end;
-    };
+    } __attribute__((packed));
 
     struct module_info
     {
         char name[MOD_NAME_LEN];
         int seg_count;
         struct segment_info segs[MAX_SEGS_PER_MODULE];
-    };
+    } __attribute__((packed));
 
     struct region_info
     {
         uint64_t start;
         uint64_t end;
-    };
+    } __attribute__((packed));
 
     struct memory_info
     {
-
         int module_count;                        // 总模块数量
         struct module_info modules[MAX_MODULES]; // 模块信息
 
         int region_count;                             // 总可扫描内存数量
         struct region_info regions[MAX_SCAN_REGIONS]; // 可扫描内存区域 (rw-p, 排除特殊区域)
-    };
+    } __attribute__((packed));
 
     // 获取进程内存信息(刷新)
     int GetMemoryInformation()
@@ -573,7 +572,7 @@ public: // 外部硬件断点接口
         BP_WRITE,      // 写
         BP_READ_WRITE, // 读写
         BP_EXECUTE     // 执行
-    };
+    } __attribute__((packed));
 
     // 断点作用线程范围
     enum bp_scope
@@ -581,7 +580,7 @@ public: // 外部硬件断点接口
         SCOPE_MAIN_THREAD,   // 仅主线程
         SCOPE_OTHER_THREADS, // 仅其他子线程
         SCOPE_ALL_THREADS    // 全部线程
-    };
+    } __attribute__((packed));
 
     // 记录单个 PC（触发指令地址）的命中状态
     struct hwbp_record
@@ -594,7 +593,7 @@ public: // 外部硬件断点接口
         uint64_t orig_x0;   // 原始 X0
         uint64_t syscallno; // 系统调用号
         uint64_t pstate;    // 处理器状态
-    };
+    } __attribute__((packed));
 
     // 存储整体命中信息
     struct hwbp_info
@@ -606,8 +605,7 @@ public: // 外部硬件断点接口
         // 记录不同 PC 触发状态的数组
         struct hwbp_record records[0x100];
         int record_count; // 当前已记录的不同 PC 数量
-    };
-
+    } __attribute__((packed));
     // 间接调用引用
     const hwbp_info &GetHwbpInfoRef()
     {
@@ -666,29 +664,28 @@ private: // 私有实现，外部无需关系
 
     enum sm_req_op
     {
-        op_o = 0, // 空调用
-        op_r = 1,
-        op_w = 2,
-        op_m = 3, // 获取进程内存信息
+        op_o, // 空调用
+        op_r,
+        op_w,
+        op_m, // 获取进程内存信息
 
-        op_down = 4,
-        op_move = 5,
-        op_up = 6,
-        op_init_touch = 50, // 初始化触摸
-        op_del_touch = 60,  // 清理触摸触摸
+        op_down,
+        op_move,
+        op_up,
+        op_init_touch, // 初始化触摸
+        op_del_touch,  // 清理触摸触摸
 
-        op_brps_weps_info = 7,      // 获取执行断点数量和访问断点数量
-        op_set_process_hwbp = 8,    // 设置硬件断点
-        op_remove_process_hwbp = 9, // 删除硬件断点
+        op_brps_weps_info,      // 获取执行断点数量和访问断点数量
+        op_set_process_hwbp,    // 设置硬件断点
+        op_remove_process_hwbp, // 删除硬件断点
 
-        exit = 100,
-        kexit = 200
-    };
+        exit,
+        kexit
+    } __attribute__((packed));
 
     // 将在队列中使用的请求实例结构体
     struct req_obj
     {
-
         std::atomic<int> kernel; // 由用户模式设置 1 = 内核有待处理的请求, 0 = 请求已完成
         std::atomic<int> user;   // 由内核模式设置 1 = 用户模式有待处理的请求, 0 = 请求已完成
 
@@ -713,10 +710,9 @@ private: // 私有实现，外部无需关系
         int POSITION_X, POSITION_Y;
         // 触摸坐标
         int x, y;
-    };
-
+    } __attribute__((packed));
     struct req_obj *req;
-    pid_t global_pid;
+    int global_pid;
 
     inline void IoCommitAndWait()
     {
@@ -758,13 +754,13 @@ private: // 私有实现，外部无需关系
     }
     void ExitCommunication()
     {
-        // 内核停止运行
-        req->op = kexit;
-        IoCommitAndWait();
-
-        // // 普通断开
-        // req->op = exit;
+        // //内核停止运行
+        // req->op = kexit;
         // IoCommitAndWait();
+
+        // 普通断开
+        req->op = exit;
+        IoCommitAndWait();
     }
     // 初始化触摸连接断开
     void InitTouch()
