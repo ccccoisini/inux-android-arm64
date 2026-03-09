@@ -19,7 +19,7 @@ static register_user_hw_breakpoint_t fn_register_user_hw_breakpoint = NULL;
 static unregister_hw_breakpoint_t fn_unregister_hw_breakpoint = NULL;
 
 // 读取 Watchpoint Value Register (WVR) - 用于读写断点
-static uint64_t read_wvr(int n)
+static inline uint64_t read_wvr(int n)
 {
     uint64_t val = 0;
     switch (n)
@@ -50,7 +50,7 @@ static uint64_t read_wvr(int n)
 }
 
 // 写入 Watchpoint Value Register (WVR) - 用于读写断点
-static void write_wvr(int n, uint64_t val)
+static inline void write_wvr(int n, uint64_t val)
 {
     switch (n)
     {
@@ -77,7 +77,7 @@ static void write_wvr(int n, uint64_t val)
 }
 
 // 读取 Breakpoint Value Register (BVR) - 用于执行断点
-static uint64_t read_bvr(int n)
+static inline uint64_t read_bvr(int n)
 {
     uint64_t val = 0;
     switch (n)
@@ -105,7 +105,7 @@ static uint64_t read_bvr(int n)
 }
 
 // 写入 Breakpoint Value Register (BVR) - 用于执行断点
-static void write_bvr(int n, uint64_t val)
+static inline void write_bvr(int n, uint64_t val)
 {
     switch (n)
     {
@@ -131,48 +131,6 @@ static void write_bvr(int n, uint64_t val)
     isb();
 }
 
-// 断点类型
-enum bp_type
-{
-    BP_READ,       // 读
-    BP_WRITE,      // 写
-    BP_READ_WRITE, // 读写
-    BP_EXECUTE     // 执行
-} __attribute__((packed));
-
-// 断点作用线程范围
-enum bp_scope
-{
-    SCOPE_MAIN_THREAD,   // 仅主线程
-    SCOPE_OTHER_THREADS, // 仅其他子线程
-    SCOPE_ALL_THREADS    // 全部线程
-} __attribute__((packed));
-
-// 记录单个 PC（触发指令地址）的命中状态
-struct hwbp_record
-{
-    uint64_t pc;        // 触发断点的汇编指令地址
-    uint64_t hit_count; // 该 PC 命中的次数
-    uint64_t regs[30];  // 最新的 X0 ~ X29 寄存器
-    uint64_t lr;        // X30
-    uint64_t sp;        // Stack Pointer
-    uint64_t orig_x0;   // 原始 X0
-    uint64_t syscallno; // 系统调用号
-    uint64_t pstate;    // 处理器状态
-} __attribute__((packed));
-
-// 存储整体命中信息
-struct hwbp_info
-{
-    uint64_t num_brps; // 执行断点的数量
-    uint64_t num_wrps; // 访问断点的数量
-    uint64_t hit_addr; // 监控的地址
-
-    // 记录不同 PC 触发状态的数组
-    struct hwbp_record records[0x100];
-    int record_count; // 当前已记录的不同 PC 数量
-} __attribute__((packed));
-
 // 链表节点，用于保存注册的 perf_event 指针，方便后续删除
 struct bp_node
 {
@@ -186,7 +144,7 @@ static DEFINE_MUTEX(bp_list_mutex);
 static DEFINE_SPINLOCK(hwbp_record_lock);
 
 // 断点触发回调函数
-static void sample_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs)
+static inline void sample_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs)
 {
     static uint64_t static_orig_addr = 0;   // 原始监控的地址
     static bool static_is_stepping = false; // 乒乓状态机标记
@@ -290,7 +248,7 @@ static void sample_hbp_handler(struct perf_event *bp, struct perf_sample_data *d
 }
 
 // 设置进程断点
-int set_process_hwbp(pid_t pid, uint64_t addr, enum bp_type type, enum bp_scope scope, int len_bytes, struct hwbp_info *info)
+static inline int set_process_hwbp(pid_t pid, uint64_t addr, enum bp_type type, enum bp_scope scope, int len_bytes, struct hwbp_info *info)
 {
     struct perf_event_attr attr;
     struct task_struct *task, *t;
@@ -429,7 +387,7 @@ int set_process_hwbp(pid_t pid, uint64_t addr, enum bp_type type, enum bp_scope 
 }
 
 // 删除进程断点
-void remove_process_hwbp(void)
+static inline void remove_process_hwbp(void)
 {
     struct bp_node *node, *tmp;
 
@@ -452,7 +410,7 @@ void remove_process_hwbp(void)
 }
 
 // 获取断点寄存器信息
-static void get_hw_breakpoint_info(struct hwbp_info *info)
+static inline void get_hw_breakpoint_info(struct hwbp_info *info)
 {
     u64 dfr0;
 

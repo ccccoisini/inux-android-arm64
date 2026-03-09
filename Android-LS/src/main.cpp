@@ -642,7 +642,7 @@ private:
             for (uintptr_t addr = rStart; addr < rEnd; addr += Config::Constants::SCAN_BUFFER) {
                 size_t sz = std::min(static_cast<size_t>(rEnd - addr),
                                      Config::Constants::SCAN_BUFFER);
-                if (dr.Read(addr, buf.data(), sz) != 0) continue;
+                if (dr.Read(addr, buf.data(), sz) <=0) continue;
 
                 for (size_t off = 0; off + sizeof(T) <= sz; off += sizeof(T)) {
                     T value;
@@ -719,7 +719,7 @@ private:
 
             size_t bytes = (oldResults[j-1] - batchStart) + sizeof(T);
             buffer.resize(bytes);
-            if (dr.Read(batchStart, buffer.data(), bytes) == 0) {
+            if (dr.Read(batchStart, buffer.data(), bytes)) {
                 for (size_t k = i; k < j; ++k) {
                     T value = *reinterpret_cast<T*>(buffer.data() + (oldResults[k] - batchStart));
                     if (MemUtils::Compare(value, target, mode, oldValues[k], rangeMax)) {
@@ -911,7 +911,7 @@ private:
         if (!out)
             return;
 
-        if (dr.Read(start, buf, len))
+        if (dr.Read(start, buf, len) <= 0)
         {
             fclose(out);
             out = nullptr;
@@ -1517,7 +1517,7 @@ public:
             {
                 uintptr_t ptr = 0;
 
-                if (dr.Read(arrayBase + i * sizeof(uintptr_t), &ptr, sizeof(ptr)) == 0)
+                if (dr.Read(arrayBase + i * sizeof(uintptr_t), &ptr, sizeof(ptr)))
                 {
                     ptr = MemUtils::Normalize(ptr);
                     if (MemUtils::IsValidAddr(ptr))
@@ -2172,7 +2172,7 @@ public:
             return;
         }
         std::ranges::fill(buffer_, 0);
-        readSuccess_ = (dr.Read(base_, buffer_.data(), buffer_.size()) == 0);
+        readSuccess_ = (dr.Read(base_, buffer_.data(), buffer_.size()));
         if (!readSuccess_)
         {
             disasmCache_.clear();
@@ -4099,7 +4099,7 @@ int mainno()
             {
                 uint64_t wv = 0x1000000000000000ULL + static_cast<uint64_t>(i);
                 bool ok = dr.Write<uint64_t>(testAddr, wv);
-                if (!ok)
+                if (ok)
                     r.writeFailCount++;
             }
             auto t1 = std::chrono::high_resolution_clock::now();

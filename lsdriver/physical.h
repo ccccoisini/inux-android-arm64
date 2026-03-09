@@ -2,6 +2,9 @@
 /*
 使用了两种方案进行读写
     1.pte直接映射任意物理地址进行读写，设置页任意属性，任意写入，不区分设备内存和系统内存
+
+(建议使用，因为都是都是通过页表建立虚拟地址→物理地址的映射。)
+底层原理都是映射
     2.是用内核线性地址读写，只能操作系统内存
 
 */
@@ -22,15 +25,17 @@
 #include <linux/pid.h>
 #include <linux/sort.h>
 #include "ExportFun.h"
+#include "io_struct.h"
 
-//============方案1:PTE读写+MMU硬件翻译地址============
-struct physical_page_info
+//============方案1:(不建议使用：顶部有说原因)PTE读写+MMU硬件翻译地址============
+
+struct pte_physical_page_info
 {
     void *base_address;
     size_t size;
     pte_t *pte_address;
 };
-static struct physical_page_info info;
+static struct pte_physical_page_info pte_info;
 
 // 直接从硬件寄存器获取内核页表基地址
 static inline pgd_t *get_kernel_pgd_base(void)
@@ -64,7 +69,7 @@ static inline int allocate_physical_page_info(void)
         return -EPERM;
     }
 
-    memset(&info, 0, sizeof(info));
+    memset(&pte_info, 0, sizeof(pte_info));
 
     // 分配内存
     vaddr = (uint64_t)vmalloc(PAGE_SIZE);
@@ -126,142 +131,119 @@ static inline int allocate_physical_page_info(void)
         goto err_out;
     }
 
-    info.base_address = (void *)vaddr;
-    info.size = PAGE_SIZE;
-    info.pte_address = ptep;
+    pte_info.base_address = (void *)vaddr;
+    pte_info.size = PAGE_SIZE;
+    pte_info.pte_address = ptep;
     return 0;
 
 err_out:
     vfree((void *)vaddr);
     return -EFAULT;
 }
+
 // 释放
 static inline void free_physical_page_info(void)
 {
-    if (info.base_address)
+    if (pte_info.base_address)
     {
         // 释放之前通过 vmalloc 分配的虚拟内存
-        vfree(info.base_address);
-        info.base_address = NULL;
+        vfree(pte_info.base_address);
+        pte_info.base_address = NULL;
     }
 }
 
-// 通过直接操作PTE，从指定的任意物理地址读取数据。
-static inline int _internal_read_fast(phys_addr_t paddr, void *buffer, size_t size)
+// 验证参数并直接操作PTE建立物理页映射
+static inline void *pte_map_page(phys_addr_t paddr, size_t size, const void *buffer)
 {
-    // MT_NORMAL_NC无缓存只读(建议用缓存MT_NORMAL因为cpu来不及把进程数据缓存写入内存，就直接读物理会有意外如：在1000000次测试下发现数据不匹配就是应为缓存没及时写入内存)
-    static const uint64_t FLAGS = PTE_TYPE_PAGE | PTE_VALID | PTE_AF | PTE_SHARED | PTE_PXN | PTE_UXN | PTE_ATTRINDX(MT_NORMAL);
-    // 注意:这个缓存指的是硬件TLB缓存和硬件L1-L3级缓存
+    static const uint64_t FLAGS = PTE_TYPE_PAGE | PTE_VALID | PTE_AF |
+                                  PTE_SHARED | PTE_PXN | PTE_UXN |
+                                  PTE_ATTRINDX(MT_NORMAL);
+    uint64_t pfn = __phys_to_pfn(paddr);
 
-    uint64_t pfn;
+    // 参数检查
     if (unlikely(!size || !buffer))
-        return -EINVAL;
-
-    pfn = __phys_to_pfn(paddr);
-
+        return ERR_PTR(-EINVAL);
     // PFN 有效性检查：确保物理页帧在系统内存管理范围内
     if (unlikely(!pfn_valid(pfn)))
-        return -EFAULT;
+        return ERR_PTR(-EFAULT);
+    // 跨页检查：读写可能跨越页边界，访问到未映射的下一页
+    if (unlikely(((paddr & ~PAGE_MASK) + size) > PAGE_SIZE))
+        return ERR_PTR(-EINVAL);
 
-    // 直接修改 PTE 指向目标物理页
-    set_pte(info.pte_address, pfn_pte(pfn, __pgprot(FLAGS)));
+    // 修改 PTE 指向目标物理页
+    set_pte(pte_info.pte_address, pfn_pte(pfn, __pgprot(FLAGS)));
 
-    // 内存全序屏障
-    // dsb(ishst);
-
-    // 刷新 TLB (只刷新单个页);
-    flush_tlb_kernel_range((uint64_t)info.base_address, (uint64_t)info.base_address + PAGE_SIZE);
+    // dsb(ishst);  // 内存全序屏障
+    // 刷新该页的 TLB
+    flush_tlb_kernel_range((uint64_t)pte_info.base_address, (uint64_t)pte_info.base_address + PAGE_SIZE);
     // flush_tlb_all();//刷新全部cpu核心TLB
-
     // isb(); // 刷新流水线，确保后续读取使用新的映射
 
-    /*
-    拷贝数据(这里没用likely检查字节对齐极端情况会导致：)
-    1.地址正好跨越了缓存行的边界（比如一个 float 一半在 Cache Line A，一半在 Cache Line B），CPU 必须发起两次总线事务。
-        在这两次读取的间隙，用户态程序正好改写了这个值。你读到的就是"前半截是新值，后半截是旧值"的撕裂数据
-    2.使用 __attribute__((packed)) 的结构体强行紧凑布局和不对齐导致
-    */
-    switch (size)
-    {
-    case 4:
-    {
-        *(uint32_t *)buffer = READ_ONCE(*(volatile uint32_t *)(info.base_address + (paddr & ~PAGE_MASK)));
-        break;
-    }
-    case 8:
-    {
-        *(uint64_t *)buffer = READ_ONCE(*(volatile uint64_t *)(info.base_address + (paddr & ~PAGE_MASK)));
-        break;
-    }
-    case 1:
-    {
-        *(uint8_t *)buffer = READ_ONCE(*(volatile uint8_t *)(info.base_address + (paddr & ~PAGE_MASK)));
-        break;
-    }
-    case 2:
-    {
-        *(uint16_t *)buffer = READ_ONCE(*(volatile uint16_t *)(info.base_address + (paddr & ~PAGE_MASK)));
-        break;
-    }
-    default:
-        memcpy(buffer, (char *)info.base_address + (paddr & ~PAGE_MASK), size);
-        break;
-    }
-
-    return 0;
+    return (uint8_t *)pte_info.base_address + (paddr & ~PAGE_MASK);
 }
-static inline int _internal_write_fast(phys_addr_t paddr, const void *buffer, size_t size)
+
+// 读取
+static inline int pte_read_physical(phys_addr_t paddr, void *buffer, size_t size)
 {
-    static const uint64_t FLAGS = PTE_TYPE_PAGE | PTE_VALID | PTE_AF | PTE_SHARED | PTE_WRITE | PTE_PXN | PTE_UXN | PTE_ATTRINDX(MT_NORMAL);
-    uint64_t pfn;
-    if (unlikely(!size || !buffer))
-        return -EINVAL;
-
-    pfn = __phys_to_pfn(paddr);
-
-    if (unlikely(!pfn_valid(pfn)))
-        return -EFAULT;
-
-    set_pte(info.pte_address, pfn_pte(pfn, __pgprot(FLAGS)));
-    flush_tlb_kernel_range((uint64_t)info.base_address, (uint64_t)info.base_address + PAGE_SIZE);
+    void *mapped = pte_map_page(paddr, size, buffer);
+    if (IS_ERR(mapped))
+        return PTR_ERR(mapped);
 
     switch (size)
     {
-    case 4:
-    {
-        WRITE_ONCE(*(volatile uint32_t *)(info.base_address + (paddr & ~PAGE_MASK)), *(const uint32_t *)buffer);
-        break;
-    }
-    case 8:
-    {
-        WRITE_ONCE(*(volatile uint64_t *)(info.base_address + (paddr & ~PAGE_MASK)), *(const uint64_t *)buffer);
-        break;
-    }
     case 1:
-    {
-        WRITE_ONCE(*(volatile uint8_t *)(info.base_address + (paddr & ~PAGE_MASK)), *(const uint8_t *)buffer);
+        *(uint8_t *)buffer = READ_ONCE(*(uint8_t *)mapped);
         break;
-    }
     case 2:
-    {
-        WRITE_ONCE(*(volatile uint16_t *)(info.base_address + (paddr & ~PAGE_MASK)), *(const uint16_t *)buffer);
+        *(uint16_t *)buffer = READ_ONCE(*(uint16_t *)mapped);
         break;
-    }
+    case 4:
+        *(uint32_t *)buffer = READ_ONCE(*(uint32_t *)mapped);
+        break;
+    case 8:
+        *(uint64_t *)buffer = READ_ONCE(*(uint64_t *)mapped);
+        break;
     default:
-        memcpy((char *)info.base_address + (paddr & ~PAGE_MASK), buffer, size);
+        memcpy(buffer, mapped, size);
         break;
     }
-
     return 0;
 }
+
+// 写入
+static inline int pte_write_physical(phys_addr_t paddr, const void *buffer, size_t size)
+{
+    void *mapped = pte_map_page(paddr, size, buffer);
+    if (IS_ERR(mapped))
+        return PTR_ERR(mapped);
+
+    switch (size)
+    {
+    case 1:
+        WRITE_ONCE(*(uint8_t *)mapped, *(const uint8_t *)buffer);
+        break;
+    case 2:
+        WRITE_ONCE(*(uint16_t *)mapped, *(const uint16_t *)buffer);
+        break;
+    case 4:
+        WRITE_ONCE(*(uint32_t *)mapped, *(const uint32_t *)buffer);
+        break;
+    case 8:
+        WRITE_ONCE(*(uint64_t *)mapped, *(const uint64_t *)buffer);
+        break;
+    default:
+        memcpy(mapped, buffer, size);
+        break;
+    }
+    return 0;
+}
+
 // 硬件mmu翻译
-static inline int translate_user_va_to_pa(struct mm_struct *mm, u64 va, phys_addr_t *pa)
+static inline int mmu_translate_va_to_pa(struct mm_struct *mm, u64 va, phys_addr_t *pa)
 {
     u64 pgd_phys;
     int ret;
     u64 phys_out;
-
-    // 替代硬编码 x10-x13寄存器
     u64 tmp_daif, tmp_ttbr, tmp_par, tmp_offset;
 
     if (unlikely(!mm || !mm->pgd || !pa))
@@ -270,78 +252,76 @@ static inline int translate_user_va_to_pa(struct mm_struct *mm, u64 va, phys_add
     pgd_phys = virt_to_phys(mm->pgd);
 
     asm volatile(
-        //  保存当前中断状态并关中断，防止抢占
+        // 关中断，防止抢占和中断嵌套
         "mrs    %[tmp_daif], daif\n"
-        "msr    daifset, #2\n"
+        "msr    daifset, #0xf\n" /* 关闭所有中断(D/A/I/F) */
+        "isb\n"
 
-        // // 临时把 ttbr0_el1 改为pgd_phys，为了后续at指令翻译需要的页表基址 (此时 ASID 为 0)
+        // 切换 TTBR0，ASID 域清零 (bits[63:48]=0)
         "mrs    %[tmp_ttbr], ttbr0_el1\n"
         "msr    ttbr0_el1, %[pgd_phys]\n"
         "isb\n"
 
-        //  硬件翻译指令
+        // 硬件地址翻译
         "at     s1e0r, %[va]\n"
         "isb\n"
         "mrs    %[tmp_par], par_el1\n"
 
-        // 清除 ASID 0 的 TLB 污染！
-        // 因为刚刚的 at 指令可能会将 ASID=0 的翻译结果缓存进 TLB
-        // 如果不清理，会导致系统关键进程命中错误的 TLB 从而引发软重启
-        "lsr    %[tmp_offset], %[va], #12\n" // 右移 12 位，构造 TLBI 需要的 VPN 格式
-        "tlbi   vale1, %[tmp_offset]\n"      // 使当前 CPU 的该 VA (ASID=0) 的 TLB 失效
-        "dsb    nsh\n"                       // 确保本地 TLB 清理完成
+        // 清除 ASID=0 的 TLB 污染
+        //  vaae1is: VA+所有ASID, EL1, Inner Shareable (广播所有核)
+        "lsr    %[tmp_offset], %[va], #12\n"
+        "tlbi   vaae1is, %[tmp_offset]\n" // 广播所有CPU，所有ASID
+        "dsb    ish\n"
+        "isb\n"
 
-        // 恢复原来的页表和中断
+        // 恢复 TTBR0
         "msr    ttbr0_el1, %[tmp_ttbr]\n"
         "isb\n"
-        "msr    daif, %[tmp_daif]\n"
 
-        // 检查翻译是否报错 (PAR_EL1 的 bit 0)
+        // 恢复中断（最后恢复，缩小窗口）
+        "msr    daif, %[tmp_daif]\n"
+        "isb\n"
+
+        // 检查 PAR_EL1.F (bit 0)，1 表示翻译失败
         "tbnz   %[tmp_par], #0, .L_efault%=\n"
 
-        // 计算物理地址
-        "and    %[tmp_par], %[tmp_par], #0xFFFFFFFFF000\n"
+        // 提取物理地址
+        // PAR_EL1[47:12] = PA[47:12]，保留低12位页内偏移
+        "ubfx   %[tmp_par], %[tmp_par], #12, #36\n"
+        "lsl    %[tmp_par], %[tmp_par], #12\n"
         "and    %[tmp_offset], %[va], #0xFFF\n"
         "orr    %[phys_out], %[tmp_par], %[tmp_offset]\n"
-
-        // 成功返回 0
         "mov    %w[ret], #0\n"
         "b      .L_end%=\n"
 
-        // 错误处理分支
         ".L_efault%=:\n"
         "mov    %w[ret], %w[efault_val]\n"
+        "mov    %[phys_out], #0\n"
 
         ".L_end%=:\n"
 
-        // 输出部分
         : [ret] "=&r"(ret),
           [phys_out] "=&r"(phys_out),
           [tmp_daif] "=&r"(tmp_daif),
           [tmp_ttbr] "=&r"(tmp_ttbr),
           [tmp_par] "=&r"(tmp_par),
           [tmp_offset] "=&r"(tmp_offset)
-
-        // 输入部分
         : [pgd_phys] "r"(pgd_phys),
           [va] "r"(va),
           [efault_val] "r"(-EFAULT)
-
-        // Clobber
         : "cc", "memory");
-    // 把写入内存的工作交回给 C 语言，编译器会生成最优的指令
+
     if (ret == 0)
-    {
         *pa = phys_out;
-    }
 
     return ret;
 }
 
-//============方案2:内核已经映射的线性地址读写+手动走页表翻译地址============
-static inline int _internal_read_fast_linear(phys_addr_t paddr, void *buffer, size_t size)
-{
+//============方案2:(建议使用,顶部有说原因)内核已经映射的线性地址读写+手动走页表翻译地址============
 
+// 读取
+static inline int linear_read_physical(phys_addr_t paddr, void *buffer, size_t size)
+{
     // 直接数学转换 在 ARM64 上，这通常等价于: (void*)(paddr + PAGE_OFFSET)
     void *kernel_vaddr = phys_to_virt(paddr);
     /*
@@ -352,42 +332,41 @@ static inline int _internal_read_fast_linear(phys_addr_t paddr, void *buffer, si
 
     switch (size)
     {
-    case 4:
-        *(uint32_t *)buffer = READ_ONCE(*(volatile uint32_t *)kernel_vaddr);
-        break;
-    case 8:
-        *(uint64_t *)buffer = READ_ONCE(*(volatile uint64_t *)kernel_vaddr);
-        break;
     case 1:
-        *(uint8_t *)buffer = READ_ONCE(*(volatile uint8_t *)kernel_vaddr);
+        *(uint8_t *)buffer = READ_ONCE(*(uint8_t *)kernel_vaddr);
         break;
     case 2:
-        *(uint16_t *)buffer = READ_ONCE(*(volatile uint16_t *)kernel_vaddr);
+        *(uint16_t *)buffer = READ_ONCE(*(uint16_t *)kernel_vaddr);
+        break;
+    case 4:
+        *(uint32_t *)buffer = READ_ONCE(*(uint32_t *)kernel_vaddr);
+        break;
+    case 8:
+        *(uint64_t *)buffer = READ_ONCE(*(uint64_t *)kernel_vaddr);
         break;
     default:
-        // 大块内存拷贝
         memcpy(buffer, kernel_vaddr, size);
         break;
     }
     return 0;
 }
-static inline int _internal_write_fast_linear(phys_addr_t paddr, void *buffer, size_t size)
+// 写入
+static inline int linear_write_physical(phys_addr_t paddr, void *buffer, size_t size)
 {
     void *kernel_vaddr = phys_to_virt(paddr);
-    // 写入操作
     switch (size)
     {
-    case 4:
-        WRITE_ONCE(*(volatile uint32_t *)kernel_vaddr, *(const uint32_t *)buffer);
-        break;
-    case 8:
-        WRITE_ONCE(*(volatile uint64_t *)kernel_vaddr, *(const uint64_t *)buffer);
-        break;
     case 1:
-        WRITE_ONCE(*(volatile uint8_t *)kernel_vaddr, *(const uint8_t *)buffer);
+        WRITE_ONCE(*(uint8_t *)kernel_vaddr, *(const uint8_t *)buffer);
         break;
     case 2:
-        WRITE_ONCE(*(volatile uint16_t *)kernel_vaddr, *(const uint16_t *)buffer);
+        WRITE_ONCE(*(uint16_t *)kernel_vaddr, *(const uint16_t *)buffer);
+        break;
+    case 4:
+        WRITE_ONCE(*(uint32_t *)kernel_vaddr, *(const uint32_t *)buffer);
+        break;
+    case 8:
+        WRITE_ONCE(*(uint64_t *)kernel_vaddr, *(const uint64_t *)buffer);
         break;
     default:
         memcpy(kernel_vaddr, buffer, size);
@@ -396,7 +375,7 @@ static inline int _internal_write_fast_linear(phys_addr_t paddr, void *buffer, s
     return 0;
 }
 // 手动走页表翻译（不再禁止中断，靠每级安全检查防护）
-static inline int manual_va_to_pa_arm_fast(struct mm_struct *mm, uint64_t vaddr, phys_addr_t *paddr)
+static inline int walk_translate_va_to_pa(struct mm_struct *mm, uint64_t vaddr, phys_addr_t *paddr)
 {
     pgd_t *pgd;
     p4d_t *p4d;
@@ -480,33 +459,36 @@ static inline int manual_va_to_pa_arm_fast(struct mm_struct *mm, uint64_t vaddr,
     return -1;
 }
 
-static inline int read_process_memory(pid_t pid, uint64_t vaddr, void *buffer, size_t size)
+// 进程读写
+static inline int _process_memory_rw(enum sm_req_op op, pid_t pid, uint64_t vaddr, void *buffer, size_t size)
 {
-    // 使用 static 缓存 mm
     static pid_t s_last_pid = 0;
     static struct mm_struct *s_last_mm = NULL;
-
-    // 使用 static 缓存页表映射结果
-    static uint64_t loop_last_vpage_base = -1;
-    static phys_addr_t loop_last_ppage_base = 0;
+    static uint64_t s_last_vpage_base = -1ULL;
+    static phys_addr_t s_last_ppage_base = 0;
 
     phys_addr_t paddr_of_page = 0;
     uint64_t current_vaddr = vaddr;
     size_t bytes_remaining = size;
     size_t bytes_copied = 0;
-    size_t bytes_real_read = 0; // 实际成功读取的字节数
+    size_t bytes_done = 0;
     int status = 0;
 
     if (unlikely(!buffer || size == 0))
         return -EINVAL;
 
-    // 检查 PID 是否改变
+    /* ---------- mm_struct 缓存 ---------- */
     if (unlikely(pid != s_last_pid || s_last_mm == NULL))
     {
-        struct pid *pid_struct = NULL;
-        struct task_struct *task = NULL;
+        struct pid *pid_struct;
+        struct task_struct *task;
 
-        // 查找新进程
+        if (s_last_mm)
+        {
+            mmput(s_last_mm); // 引用计数-1
+            s_last_mm = 0;
+        }
+
         pid_struct = find_get_pid(pid);
         if (!pid_struct)
             return -ESRCH;
@@ -516,169 +498,91 @@ static inline int read_process_memory(pid_t pid, uint64_t vaddr, void *buffer, s
         if (!task)
             return -ESRCH;
 
-        // 直接把引用计数释放了，底层翻译确保不出问题
-        s_last_mm = get_task_mm(task); // 引用计数 +1
+        s_last_mm = get_task_mm(task); // 引用计数+1
         put_task_struct(task);
 
         if (!s_last_mm)
             return -EINVAL;
-        mmput(s_last_mm); // 引用计数 -1
 
         s_last_pid = pid;
-
-        //  切换进程后，必须作废上一个进程的地址缓存！
-        loop_last_vpage_base = -1;
+        s_last_vpage_base = -1ULL;
     }
 
+    /* ---------- 逐页循环 ---------- */
     while (bytes_remaining > 0)
     {
         size_t page_offset = current_vaddr & (PAGE_SIZE - 1);
-        size_t bytes_to_read_this_page = PAGE_SIZE - page_offset;
+        size_t bytes_this_page = PAGE_SIZE - page_offset;
         uint64_t current_vpn = current_vaddr & PAGE_MASK;
 
-        if (bytes_to_read_this_page > bytes_remaining)
-            bytes_to_read_this_page = bytes_remaining;
+        if (bytes_this_page > bytes_remaining)
+            bytes_this_page = bytes_remaining;
 
-        // 软件 TLB 优化
-        if (current_vpn == loop_last_vpage_base)
+        /* 软件 TLB 缓存 */
+        if (current_vpn == s_last_vpage_base)
         {
-            paddr_of_page = loop_last_ppage_base;
+            paddr_of_page = s_last_ppage_base;
         }
         else
         {
             // 翻译地址
-            status = translate_user_va_to_pa(s_last_mm, current_vpn, &paddr_of_page);
+            // status = mmu_translate_va_to_pa(s_last_mm, current_vpn, &paddr_of_page);
+            status = walk_translate_va_to_pa(s_last_mm, current_vpn, &paddr_of_page);
+
             if (unlikely(status != 0))
             {
-                memset((char *)buffer + bytes_copied, 0, bytes_to_read_this_page);
-                loop_last_vpage_base = -1;
+                s_last_vpage_base = -1ULL;
+                if (op == op_r)
+                    memset((uint8_t *)buffer + bytes_copied, 0, bytes_this_page);
                 goto next_chunk;
             }
-
-            // 更新缓存
-            loop_last_vpage_base = current_vpn;
-            loop_last_ppage_base = paddr_of_page;
+            s_last_vpage_base = current_vpn;
+            s_last_ppage_base = paddr_of_page;
         }
 
-        // 执行物理内存读取
-        status = _internal_read_fast(paddr_of_page + page_offset, (char *)buffer + bytes_copied, bytes_to_read_this_page);
-
-        if (unlikely(status != 0))
+        /* 执行读/写 */
+        if (op == op_r)
         {
-            // 物理读取失败，填0跳过这一段
-            memset((char *)buffer + bytes_copied, 0, bytes_to_read_this_page);
-            loop_last_vpage_base = -1;
-            goto next_chunk;
-        }
 
-        // 只有成功才计入实际读取量
-        bytes_real_read += bytes_to_read_this_page;
-
-    next_chunk:
-        bytes_remaining -= bytes_to_read_this_page;
-        bytes_copied += bytes_to_read_this_page;
-        current_vaddr += bytes_to_read_this_page;
-    }
-
-    // 实际读取字节数为0才返回失败
-    if (bytes_real_read == 0)
-        return -EFAULT;
-
-    return 0;
-}
-static inline int write_process_memory(pid_t pid, uint64_t vaddr, void *buffer, size_t size)
-{
-    // 使用 static 缓存 mm
-    static pid_t s_last_pid = 0;
-    static struct mm_struct *s_last_mm = NULL;
-
-    // 使用 static 缓存页表映射结果
-    static uint64_t loop_last_vpage_base = -1;
-    static phys_addr_t loop_last_ppage_base = 0;
-
-    phys_addr_t paddr_of_page = 0;
-    uint64_t current_vaddr = vaddr;
-    size_t bytes_remaining = size;
-    size_t bytes_copied = 0;
-    size_t bytes_real_write = 0;
-    int status = 0;
-
-    if (unlikely(!buffer || size == 0))
-        return -EINVAL;
-
-    if (unlikely(pid != s_last_pid || s_last_mm == NULL))
-    {
-        struct pid *pid_struct = NULL;
-        struct task_struct *task = NULL;
-
-        pid_struct = find_get_pid(pid);
-        if (!pid_struct)
-            return -ESRCH;
-
-        task = get_pid_task(pid_struct, PIDTYPE_PID);
-        put_pid(pid_struct);
-        if (!task)
-            return -ESRCH;
-        s_last_mm = get_task_mm(task); // 引用计数 +1
-        put_task_struct(task);
-
-        if (!s_last_mm)
-            return -EINVAL;
-        mmput(s_last_mm); // 引用计数 -1
-        s_last_pid = pid;
-
-        loop_last_vpage_base = -1;
-    }
-
-    while (bytes_remaining > 0)
-    {
-        size_t page_offset = current_vaddr & (PAGE_SIZE - 1);
-        size_t bytes_to_read_this_page = PAGE_SIZE - page_offset;
-        uint64_t current_vpn = current_vaddr & PAGE_MASK;
-
-        if (bytes_to_read_this_page > bytes_remaining)
-            bytes_to_read_this_page = bytes_remaining;
-
-        if (current_vpn == loop_last_vpage_base)
-        {
-            paddr_of_page = loop_last_ppage_base;
+            // status = pte_read_physical(paddr_of_page + page_offset, (uint8_t *)buffer + bytes_copied, bytes_this_page);
+            status = linear_read_physical(paddr_of_page + page_offset, (uint8_t *)buffer + bytes_copied, bytes_this_page);
         }
         else
         {
 
-            status = translate_user_va_to_pa(s_last_mm, current_vpn, &paddr_of_page);
-            if (unlikely(status != 0))
-            {
-
-                loop_last_vpage_base = -1;
-                goto next_chunk;
-            }
-
-            loop_last_vpage_base = current_vpn;
-            loop_last_ppage_base = paddr_of_page;
+            // status = pte_write_physical(paddr_of_page + page_offset, (const uint8_t *)buffer + bytes_copied, bytes_this_page);
+            status = linear_write_physical(paddr_of_page + page_offset, (uint8_t *)buffer + bytes_copied, bytes_this_page);
         }
 
-        status = _internal_write_fast(paddr_of_page + page_offset, (char *)buffer + bytes_copied, bytes_to_read_this_page);
         if (unlikely(status != 0))
         {
-
-            loop_last_vpage_base = -1;
+            s_last_vpage_base = -1ULL;
+            if (op == op_r)
+                memset((uint8_t *)buffer + bytes_copied, 0, bytes_this_page);
             goto next_chunk;
         }
 
-        bytes_real_write += bytes_to_read_this_page;
+        bytes_done += bytes_this_page;
 
     next_chunk:
-        bytes_remaining -= bytes_to_read_this_page;
-        bytes_copied += bytes_to_read_this_page;
-        current_vaddr += bytes_to_read_this_page;
+        bytes_remaining -= bytes_this_page;
+        bytes_copied += bytes_this_page;
+        current_vaddr += bytes_this_page;
     }
 
-    if (bytes_real_write == 0)
-        return -EFAULT;
-
-    return 0;
+    return (bytes_done == 0) ? -EFAULT : (int)bytes_done;
 }
+
+/* ---------- 对外接口 ---------- */
+static inline int read_process_memory(pid_t pid, uint64_t vaddr, void *buffer, size_t size)
+{
+    return _process_memory_rw(op_r, pid, vaddr, buffer, size);
+}
+static inline int write_process_memory(pid_t pid, uint64_t vaddr, void *buffer, size_t size)
+{
+    return _process_memory_rw(op_w, pid, vaddr, buffer, size);
+}
+
 
 /*
  maps 文件
@@ -739,43 +643,7 @@ Modifier's View :
 
 #define VMA_IS_RWP(vma) (VMA_IS_RW(vma) && !((vma)->vm_flags & VM_SHARED)) // rw-p (私有)
 
-#define MAX_MODULES 512
-#define MAX_SCAN_REGIONS 4096
-
-#define MOD_NAME_LEN 256
-#define MAX_SEGS_PER_MODULE 256
-
-struct segment_info
-{
-    short index;  // >=0: 普通段(RX→RO→RW连续编号), -1: BSS段
-    uint8_t prot; // 区段权限: 1(R), 2(W), 4(X)。例如 RX 就是 5 (1+4)
-    uint64_t start;
-    uint64_t end;
-} __attribute__((packed));
-
-struct module_info
-{
-    char name[MOD_NAME_LEN];
-    int seg_count;
-    struct segment_info segs[MAX_SEGS_PER_MODULE];
-} __attribute__((packed));
-
-struct region_info
-{
-    uint64_t start;
-    uint64_t end;
-} __attribute__((packed));
-
-struct memory_info
-{
-    int module_count;                        // 总模块数量
-    struct module_info modules[MAX_MODULES]; // 模块信息
-
-    int region_count;                             // 总可扫描内存数量
-    struct region_info regions[MAX_SCAN_REGIONS]; // 可扫描内存区域 (rw-p, 排除特殊区域)
-} __attribute__((packed));
-
-static int find_or_add_module(struct module_info *modules, int *module_count, const char *name)
+static inline int find_or_add_module(struct module_info *modules, int *module_count, const uint8_t *name)
 {
     int i;
     for (i = 0; i < *module_count; i++)
@@ -789,7 +657,7 @@ static int find_or_add_module(struct module_info *modules, int *module_count, co
     return i;
 }
 
-static void add_seg(struct module_info *m, short type_tag, uint8_t prot, uint64_t start, uint64_t end)
+static inline void add_seg(struct module_info *m, short type_tag, uint8_t prot, uint64_t start, uint64_t end)
 {
     if (m->seg_count >= MAX_SEGS_PER_MODULE)
         return;
@@ -800,13 +668,14 @@ static void add_seg(struct module_info *m, short type_tag, uint8_t prot, uint64_
     m->seg_count++;
 }
 
-static int enum_process_memory(pid_t pid, struct memory_info *info)
+static inline int enum_process_memory(pid_t pid, struct memory_info *info)
 {
     struct task_struct *task = NULL;
     struct mm_struct *mm = NULL;
     struct vm_area_struct *vma, *prev = NULL;
-    char *path_buf, *path, *prev_path;
-    int idx, i, j;
+    char *path_buf, *path;
+    int last_mod_idx = -1; // 用于记录上一个VMA的模块归属，极大优化BSS检测性能
+    int i, j;
     short seq;
     bool excluded, mod_accepted;
 
@@ -857,7 +726,6 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
 
     FOR_EACH_VMA_UNIFIED(vma)
     {
-
         // 直接用位运算将权限转为 1(R) 2(W) 4(X)
         uint8_t current_prot = 0;
         if (vma->vm_flags & VM_READ)
@@ -869,32 +737,22 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
 
         /* ========== 模块收集 (仅白名单前缀) ========== */
 
-        // BSS检测: 前段文件映射RW, 当前段匿名+地址连续+RW
-        if (prev && prev->vm_file && VMA_IS_RW(prev) && !vma->vm_file && vma->vm_start == prev->vm_end && VMA_IS_RW(vma))
+        // 优化后的 BSS 检测：放宽对 prev 权限的限制，并去掉了昂贵的 d_path 调用
+        // 条件：有prev、当前匿名(无文件)、当前为RW、地址严格首尾相连、且 prev 属于我们追踪的模块
+        if (prev && !vma->vm_file && vma->vm_start == prev->vm_end &&
+            VMA_IS_RW(vma) && last_mod_idx >= 0)
         {
-            prev_path = d_path(&prev->vm_file->f_path, path_buf, PATH_MAX);
-            if (!IS_ERR(prev_path))
-            {
-                mod_accepted = false;
-                for (i = 0; mod_include_prefixes[i]; i++)
-                    if (strncmp(prev_path, mod_include_prefixes[i],
-                                strlen(mod_include_prefixes[i])) == 0)
-                    {
-                        mod_accepted = true;
-                        break;
-                    }
-                if (mod_accepted)
-                {
-                    idx = find_or_add_module(info->modules, &info->module_count, prev_path);
-                    if (idx >= 0)
-                        add_seg(&info->modules[idx], -1, current_prot, vma->vm_start, vma->vm_end);
-                }
-            }
-        }
+            // 直接复用上一轮循环得到的 last_mod_idx，极大提升性能
+            add_seg(&info->modules[last_mod_idx], -1, current_prot, vma->vm_start, vma->vm_end);
 
-        // 文件映射区段
-        if (vma->vm_file)
+            // 注意：BSS 之后通常不会紧跟同一个模块的内容了，清空归属防止误判后续的匿名堆内存
+            last_mod_idx = -1;
+        }
+        else if (vma->vm_file)
         {
+            // 每次遇到新的文件映射，先重置归属状态
+            last_mod_idx = -1;
+
             path = d_path(&vma->vm_file->f_path, path_buf, PATH_MAX);
             if (!IS_ERR(path))
             {
@@ -909,23 +767,19 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
                 }
                 if (mod_accepted)
                 {
-                    idx = find_or_add_module(info->modules, &info->module_count, path);
-                    if (idx >= 0)
+                    last_mod_idx = find_or_add_module(info->modules, &info->module_count, path);
+                    if (last_mod_idx >= 0)
                     {
-                        // 无视具体权限，只要是该文件映射全部收录，绝不留空洞
-                        // 初步给个标签：有X=0(代码), 纯R=1(只读), 有W=2(数据)
-                        short init_tag = 1; // 默认 RO
-                        if (current_prot & 4)
-                            init_tag = 0; // 只要含 X，归为 RX
-                        else if (current_prot & 2)
-                            init_tag = 2; // 只要含 W，归为 RW
-                        else if (current_prot == 0)
-                            init_tag = 0; // PROT_NONE 通常是代码段暗桩
-
-                        add_seg(&info->modules[idx], init_tag, current_prot, vma->vm_start, vma->vm_end);
+                        // 标签随便给 0 即可，因为后面的“反作弊拓扑打标”会根据物理形态强制洗白并覆盖它
+                        add_seg(&info->modules[last_mod_idx], 0, current_prot, vma->vm_start, vma->vm_end);
                     }
                 }
             }
+        }
+        else
+        {
+            // 既不是目标文件映射，也不是紧连着的BSS，断开模块连结
+            last_mod_idx = -1;
         }
 
         /* ========== 扫描区域收集 ========== */
@@ -1196,13 +1050,13 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
             int out_idx = 0;
             for (j = 1; j < m->seg_count; j++)
             {
-                struct segment_info *prev = &m->segs[out_idx];
-                struct segment_info *curr = &m->segs[j];
+                struct segment_info *prev_seg = &m->segs[out_idx];
+                struct segment_info *curr_seg = &m->segs[j];
 
-                if (prev->end == curr->start && prev->index == curr->index)
+                if (prev_seg->end == curr_seg->start && prev_seg->index == curr_seg->index)
                 {
-                    prev->end = curr->end;
-                    prev->prot |= curr->prot;
+                    prev_seg->end = curr_seg->end;
+                    prev_seg->prot |= curr_seg->prot;
                 }
                 else
                 {
@@ -1210,7 +1064,7 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
                     // 避免不必要的自我覆盖
                     if (out_idx != j)
                     {
-                        m->segs[out_idx] = *curr;
+                        m->segs[out_idx] = *curr_seg;
                     }
                 }
             }

@@ -12,77 +12,25 @@
 #include <linux/kobject.h>
 #include <linux/kallsyms.h>
 
+#include "io_struct.h"
 #include "ExportFun.h"
 #include "physical.h"
 #include "hwbp.h"
-
-enum sm_req_op
-{
-	op_o, // 空调用
-	op_r,
-	op_w,
-	op_m, // 获取进程内存信息
-
-	op_down,
-	op_move,
-	op_up,
-	op_init_touch, // 初始化触摸
-	op_del_touch,  // 清理触摸触摸
-
-	op_brps_weps_info,		// 获取执行断点数量和访问断点数量
-	op_set_process_hwbp,	// 设置硬件断点
-	op_remove_process_hwbp, // 删除硬件断点
-
-	exit,
-	kexit
-} __attribute__((packed));
-
-#include "virtual_input.h" //在这里预处理展开，方便使用req_op
-
-// 将在队列中使用的请求实例结构体
-struct req_obj
-{
-
-	atomic_t kernel; // 由用户模式设置 1 = 内核有待处理的请求, 0 = 请求已完成
-	atomic_t user;	 // 由内核模式设置 1 = 用户模式有待处理的请求, 0 = 请求已完成
-
-	enum sm_req_op op; // shared memory请求操作类型
-	int status;		   // 操作状态
-
-	// 内存读取
-	int pid;
-	uint64_t target_addr;
-	int size;
-	char user_buffer[0x1000]; // 物理标准页大小
-
-	// 进程内存信息
-	struct memory_info mem_info;
-
-	enum bp_type bt;		  // 断点类型
-	enum bp_scope bs;		  // 断点作用线程范围
-	int len_bytes;			  // 断点长度字节
-	struct hwbp_info bp_info; // 断点信息
-
-	// 初始化触摸驱动返回屏幕维度
-	int POSITION_X, POSITION_Y;
-	// 触摸坐标
-	int x, y;
-} __attribute__((packed));
+#include "virtual_input.h"
 
 static struct req_obj *req = NULL;
 
-volatile static bool ProcessExit = 0; // 用户进程默认未启动
-
-volatile static bool KThreadExit = 1; // 内核线程默认启用
+static atomic_t ProcessExit = ATOMIC_INIT(0); // 用户进程默认未启动
+static atomic_t KThreadExit = ATOMIC_INIT(1); // 内核线程默认启用
 
 static int DispatchThreadFunction(void *data)
 {
 	// 自旋计数器：用来记录我们空转了多久
 	int spin_count = 0;
 
-	while (KThreadExit)
+	while (atomic_read(&KThreadExit))
 	{
-		if (ProcessExit)
+		if (atomic_read(&ProcessExit))
 		{
 			// 先“偷看”一眼有没有任务 (atomic_read 开销极小)
 			// 避免每次循环都执行 atomic_xchg (写操作，锁总线，慢)
@@ -127,18 +75,18 @@ static int DispatchThreadFunction(void *data)
 					case op_remove_process_hwbp:
 						remove_process_hwbp();
 						break;
-					case exit:
-						ProcessExit = 0;
+					case op_exit:
+						atomic_xchg(&ProcessExit, 0); // 标记用户进程已断开
 						break;
-					case kexit:
-						KThreadExit = 0;
+					case op_kexit:
+						atomic_xchg(&KThreadExit, 0); // 标记内核线程退出
 						break;
 					default:
 						break;
 					}
 
 					// 通知用户层完成
-					atomic_set(&req->user, 1);
+					atomic_set(&req->user, 1); // 这里不要使用atomic_xchg锁总线，抢锁
 				}
 			}
 			else
@@ -180,10 +128,10 @@ static int ConnectThreadFunction(void *data)
 	int i;
 
 	// 和内核线程在运行
-	while (KThreadExit)
+	while (atomic_read(&KThreadExit))
 	{
 		// 请求进程处于未启用
-		if (!ProcessExit)
+		if (!atomic_read(&ProcessExit))
 		{
 			// 遍历系统中所有进程,//这里不加RCU锁，不然会导致6.6以上超时
 			for_each_process(task)
@@ -236,10 +184,13 @@ static int ConnectThreadFunction(void *data)
 					goto out_put_pages;
 				}
 
-				// 成功：vmap 持有页面引用，只需释放 mm
-				ProcessExit = 1;
-				atomic_xchg(&req->user, 1);
+				// 成功 get_user_pages_remote 持有页面引用，只需释放 mm
+				atomic_xchg(&ProcessExit, 1); // 标记用户进程已连接
+				atomic_xchg(&req->user, 1);	  // 通知用户层已连接
+				kfree(pages);
+				pages = NULL;
 				mmput(mm);
+				mm = NULL;
 				break; // 找到目标进程，退出遍历
 
 			out_put_pages:
@@ -311,7 +262,7 @@ static int __init lsdriver_init(void)
 
 	hide_myself(); // 隐藏内核模块本身
 
-	allocate_physical_page_info(); // pte读写需要，线性读写不需要 // 初始化物理页地址和页表项
+	// allocate_physical_page_info(); // pte读写需要，线性读写不需要 // 初始化物理页地址和页表项
 
 	chf = kthread_run(ConnectThreadFunction, NULL, "C_thread");
 	if (IS_ERR(chf))
