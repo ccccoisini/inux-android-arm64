@@ -542,7 +542,7 @@ private:
     // ── mmap 辅助 ──
     static int createTmpFd(size_t sz)
     {
-        char tpl[] = "/tmp/memscan_XXXXXX";
+        char tpl[] = "/data/local/tmp/memscan_XXXXXX";
         int fd = mkstemp(tpl);
         if (fd < 0)
             return -1;
@@ -804,8 +804,21 @@ private:
                     {
                         size_t sz = std::min(static_cast<size_t>(reg.end - addr),
                                              Config::Constants::SCAN_BUFFER);
-                        if (dr.Read(addr, buf.data(), sz) <= 0) continue;
-                        for (size_t off = 0; off + sizeof(T) <= sz; off += sizeof(T))
+                        int readBytes = dr.Read(addr, buf.data(), sz);
+                        if (readBytes <= 0)
+                        {
+                            // 读失败时，将该块对应的候选置为无效，避免后续误报
+                            for (size_t off = 0; off + sizeof(T) <= sz; off += sizeof(T))
+                            {
+                                size_t gb = reg.bitOffset + (addr + off - reg.start) / sizeof(T);
+                                setBitOff(gb);
+                                valuesMap_[gb] = 0.0;
+                            }
+                            continue;
+                        }
+
+                        size_t usable = static_cast<size_t>(readBytes);
+                        for (size_t off = 0; off + sizeof(T) <= usable; off += sizeof(T))
                         {
                             T value;
                             std::memcpy(&value, buf.data() + off, sizeof(T));
@@ -856,8 +869,10 @@ private:
                     {
                         size_t sz = std::min(static_cast<size_t>(rEnd - addr),
                                              Config::Constants::SCAN_BUFFER);
-                        if (dr.Read(addr, buf.data(), sz) <= 0) continue;
-                        for (size_t off = 0; off + sizeof(T) <= sz; off += sizeof(T))
+                        int readBytes = dr.Read(addr, buf.data(), sz);
+                        if (readBytes <= 0) continue;
+                        size_t usable = static_cast<size_t>(readBytes);
+                        for (size_t off = 0; off + sizeof(T) <= usable; off += sizeof(T))
                         {
                             T value;
                             std::memcpy(&value, buf.data() + off, sizeof(T));
@@ -1078,18 +1093,22 @@ private:
 
                     size_t bytes = (oldR[j-1] - batchStart) + sizeof(T);
                     buffer.resize(bytes);
-                    if (dr.Read(batchStart, buffer.data(), bytes))
+                    int readBytes = dr.Read(batchStart, buffer.data(), bytes);
+                    if (readBytes <= 0)
+                        continue;
+                    size_t usable = static_cast<size_t>(readBytes);
+                    for (size_t k = i; k < j; ++k)
                     {
-                        for (size_t k = i; k < j; ++k)
+                        size_t offset = oldR[k] - batchStart;
+                        if (offset + sizeof(T) > usable)
+                            break;
+                        T value;
+                        std::memcpy(&value,
+                                    buffer.data() + offset, sizeof(T));
+                        if (MemUtils::Compare(value, target, mode, oldV[k], rmx))
                         {
-                            T value;
-                            std::memcpy(&value,
-                                buffer.data() + (oldR[k] - batchStart), sizeof(T));
-                            if (MemUtils::Compare(value, target, mode, oldV[k], rmx))
-                            {
-                                tR[t].push_back(oldR[k]);
-                                tV[t].push_back(toDouble(value, mode));
-                            }
+                            tR[t].push_back(oldR[k]);
+                            tV[t].push_back(toDouble(value, mode));
                         }
                     }
                     done += (j - i);
@@ -1207,6 +1226,12 @@ public:
     void add(uintptr_t addr)
     {
         std::unique_lock lock(mutex_);
+        // Empty 模式时，初始化为 Compact 模式
+        if (mode_ == Mode::Empty)
+        {
+            mode_ = Mode::Compact;
+        }
+
         if (mode_ == Mode::Compact)
         {
             auto it = std::ranges::lower_bound(results_, addr);
