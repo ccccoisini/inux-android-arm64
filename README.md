@@ -1,4 +1,4 @@
-# lsdriver 驱动说明（以当前源码为准）
+# 内存调试分析驱动
 
 > 仅供技术研究与学习，严禁用于非法用途。作者不承担任何违法责任。
 
@@ -242,46 +242,4 @@ QQ:1092055800
 ```bash
 make -C <KDIR> M=$PWD/lsdriver ARCH=arm64 LLVM=1 modules
 ```
-
-### 9.2 模块 Makefile 当前关键参数
-
-- `obj-m += lsdriver.o`
-- `ccflags-y += -O3`
-- `ccflags-y += -Wno-error`
-- `ccflags-y += -fno-stack-protector`
-- `ccflags-y += -fomit-frame-pointer`
-- `ccflags-y += -funroll-loops`
-- `ccflags-y += -fstrict-aliasing`
-- `ccflags-y += -ffunction-sections -fdata-sections`
-
-### 9.3 仓库内已有产物（`lsdriver/`）
-
-- `android12-5.10lsdriver.ko`
-- `android13-5.10lsdriver.ko`
-- `android13-5.15lsdriver.ko`
-- `android14-6.1lsdriver.ko`
-- `android15-6.6lsdriver.ko`
-- `android16-6.12lsdriver.ko`
-
----
-
-## 10. 使用前提与限制（按当前代码）
-
-1. 用户进程名必须是 `LS`（连接线程硬编码匹配）。
-2. 共享内存虚拟地址固定为 `0x2025827000`。
-3. 单次读写缓冲 `user_buffer` 固定 `0x1000` 字节。
-4. 模块初始化后立即做隐藏处理，常规 `rmmod` 流程不适合作为回收路径。
-5. 触摸和断点逻辑依赖 ARM64 输入子系统/硬件断点能力，不同设备内核行为可能有差异。
-
----
-
-## 11. 后续维护建议
-
-如果你后续继续改驱动代码，建议 README 同步关注这几块：
-
-1. `enum sm_req_op` 变更（协议兼容）
-2. `req_obj` 结构变更（用户态同步）
-3. 连接条件（进程名、共享地址、握手机制）
-4. 内存读写后端切换（PTE vs 线性映射）
-5. 触摸/断点能力开关与版本适配分支
 
