@@ -39,14 +39,15 @@ include $(BUILD_EXECUTABLE)
 AKERNEL_MODULE := tcp_server
 AKERNEL_PUSH_DIR := /data/akernel
 AKERNEL_REMOTE_FILE := $(AKERNEL_PUSH_DIR)/$(AKERNEL_MODULE)
+AKERNEL_TMP_FILE := /data/local/tmp/$(AKERNEL_MODULE)
 AKERNEL_BINARY := $(NDK_APP_LIBS_OUT)/$(TARGET_ARCH_ABI)/$(AKERNEL_MODULE)
 
 .PHONY: push-akernel
 
 push-akernel: $(AKERNEL_BINARY)
-	@echo [AKERNEL] push $(AKERNEL_BINARY) to $(AKERNEL_REMOTE_FILE)
+	@echo [AKERNEL] push $(AKERNEL_BINARY) to $(AKERNEL_TMP_FILE), then move to $(AKERNEL_REMOTE_FILE) as root
 	@adb shell "su -c 'killall $(AKERNEL_MODULE) >/dev/null 2>&1 || true; mkdir -p $(AKERNEL_PUSH_DIR)'"
-	@adb push "$(call host-path,$(AKERNEL_BINARY))" "$(AKERNEL_REMOTE_FILE)"
-	@adb shell "su -c 'chmod 755 $(AKERNEL_REMOTE_FILE)'"
+	@adb push "$(call host-path,$(AKERNEL_BINARY))" "$(AKERNEL_TMP_FILE)"
+	@adb shell "su -c 'cp $(AKERNEL_TMP_FILE) $(AKERNEL_REMOTE_FILE) && chmod 755 $(AKERNEL_REMOTE_FILE) && rm -f $(AKERNEL_TMP_FILE)'"
 
 all: push-akernel

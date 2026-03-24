@@ -85,12 +85,12 @@ namespace Types
         Unchanged,
         Range,
         Pointer,
+        String,
         Count
     };
     enum class ViewFormat : uint8_t
     {
         Hex,
-        Hex16,
         Hex64,
         I8,
         I16,
@@ -132,11 +132,11 @@ namespace Types
             "未变化",
             "范围",
             "指针",
+            "String",
         };
 
         inline constexpr std::array<const char *, static_cast<size_t>(ViewFormat::Count)> FORMAT = {
             "Hex",
-            "Hex16",
             "Hex64",
             "Int8",
             "Int16",
@@ -151,7 +151,7 @@ namespace Types
     namespace detail
     {
         constexpr std::array<size_t, 6> kDataSizes = {1, 2, 4, 8, 4, 8};
-        constexpr std::array<size_t, 10> kViewSizes = {1, 2, 8, 1, 2, 4, 8, 4, 8, 4};
+        constexpr std::array<size_t, 9> kViewSizes = {1, 8, 1, 2, 4, 8, 4, 8, 4};
     }
 
     // 根据数据类型返回对应字节数。
@@ -279,6 +279,33 @@ namespace MemUtils
     }
 
     // 读取指针值并格式化为十六进制文本。
+    inline std::string ReadAsText(uintptr_t addr, size_t maxLen = 64)
+    {
+        addr = Normalize(addr);
+        if (!addr)
+            return "??";
+
+        maxLen = std::clamp<size_t>(maxLen, 1, 256);
+        std::string value = dr.ReadString(addr, maxLen);
+        for (char &ch : value)
+        {
+            unsigned char u = static_cast<unsigned char>(ch);
+            if (u < 0x20 && ch != '\t')
+                ch = '.';
+        }
+        return value;
+    }
+
+    inline bool WriteText(uintptr_t addr, std::string_view str)
+    {
+        addr = Normalize(addr);
+        if (!addr || str.empty())
+            return false;
+
+        std::string temp(str);
+        return dr.Write(addr, temp.data(), temp.size()) > 0;
+    }
+
     inline std::string ReadAsPointerString(uintptr_t addr)
     {
         addr = Normalize(addr);
@@ -992,6 +1019,158 @@ private:
         setBits_ = survived.load();
     }
 
+    void scanFirstString(const std::string &needle)
+    {
+        if (needle.empty())
+            return;
+
+        auto scanRegs = dr.GetScanRegions();
+        if (scanRegs.empty())
+            return;
+
+        {
+            std::unique_lock lock(mutex_);
+            bitmap_.release();
+            values_.release();
+            regions_.clear();
+            setBits_ = 0;
+            valueSize_ = 0;
+            addedList_.clear();
+        }
+
+        const size_t patLen = needle.size();
+        if (patLen > Config::Constants::SCAN_BUFFER)
+            return;
+
+        unsigned tc = std::max(1u, static_cast<unsigned>(
+                                       std::min(static_cast<size_t>(Utils::GetThreadCount()), scanRegs.size())));
+        size_t chunk = (scanRegs.size() + tc - 1) / tc;
+        std::atomic<size_t> done{0};
+
+        std::vector<std::deque<uintptr_t>> threadHits(tc);
+        std::vector<std::future<void>> futs;
+        futs.reserve(tc);
+
+        const size_t step = (Config::Constants::SCAN_BUFFER > patLen)
+                                ? (Config::Constants::SCAN_BUFFER - patLen + 1)
+                                : 1;
+
+        for (unsigned t = 0; t < tc; ++t)
+        {
+            futs.push_back(Utils::GlobalPool.push([&, t]
+                                                  {
+                auto &myHits = threadHits[t];
+                std::vector<uint8_t> buf(Config::Constants::SCAN_BUFFER);
+                size_t end = std::min(t * chunk + chunk, scanRegs.size());
+
+                for (size_t ri = t * chunk; ri < end && Config::g_Running; ++ri) {
+                    auto [start, finish] = scanRegs[ri];
+                    if (finish <= start || static_cast<size_t>(finish - start) < patLen)
+                    {
+                        if ((done.fetch_add(1) & 0x3F) == 0)
+                            progress_ = static_cast<float>(done) / scanRegs.size();
+                        continue;
+                    }
+
+                    for (uintptr_t addr = start; addr + patLen <= finish;) {
+                        size_t readSize = std::min(static_cast<size_t>(finish - addr), Config::Constants::SCAN_BUFFER);
+                        int readBytes = dr.Read(addr, buf.data(), readSize);
+                        if (readBytes > 0) {
+                            size_t usable = static_cast<size_t>(readBytes);
+                            if (usable >= patLen) {
+                                size_t uniqueLimit = (addr + step < finish) ? std::min(step, usable) : usable;
+                                for (size_t off = 0; off + patLen <= usable && off < uniqueLimit; ++off) {
+                                    if (std::memcmp(buf.data() + off, needle.data(), patLen) == 0)
+                                        myHits.push_back(addr + off);
+                                }
+                            }
+                        }
+
+                        if (addr + step <= addr || addr + step >= finish)
+                            break;
+                        addr += step;
+                    }
+
+                    if ((done.fetch_add(1) & 0x3F) == 0)
+                        progress_ = static_cast<float>(done) / scanRegs.size();
+                } }));
+        }
+
+        for (auto &f : futs)
+            f.get();
+
+        std::vector<uintptr_t> merged;
+        for (auto &hits : threadHits)
+        {
+            merged.insert(merged.end(), hits.begin(), hits.end());
+        }
+        std::sort(merged.begin(), merged.end());
+        merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
+
+        std::unique_lock lock(mutex_);
+        addedList_.swap(merged);
+        setBits_ = 0;
+    }
+
+    void scanNextString(const std::string &needle)
+    {
+        if (needle.empty())
+            return;
+
+        std::vector<uintptr_t> current;
+        {
+            std::shared_lock lock(mutex_);
+            current = addedList_;
+        }
+        if (current.empty())
+            return;
+
+        const size_t patLen = needle.size();
+        unsigned tc = std::max(1u, static_cast<unsigned>(
+                                       std::min(static_cast<size_t>(Utils::GetThreadCount()), current.size())));
+        size_t chunk = (current.size() + tc - 1) / tc;
+        std::atomic<size_t> done{0};
+
+        std::vector<std::vector<uintptr_t>> threadHits(tc);
+        std::vector<std::future<void>> futs;
+        futs.reserve(tc);
+
+        for (unsigned t = 0; t < tc; ++t)
+        {
+            futs.push_back(Utils::GlobalPool.push([&, t]
+                                                  {
+                auto &myHits = threadHits[t];
+                std::vector<uint8_t> buf(patLen);
+                size_t end = std::min(t * chunk + chunk, current.size());
+                for (size_t i = t * chunk; i < end && Config::g_Running; ++i) {
+                    uintptr_t addr = current[i];
+                    int readBytes = dr.Read(addr, buf.data(), patLen);
+                    if (readBytes > 0 && static_cast<size_t>(readBytes) >= patLen &&
+                        std::memcmp(buf.data(), needle.data(), patLen) == 0) {
+                        myHits.push_back(addr);
+                    }
+
+                    size_t finished = done.fetch_add(1) + 1;
+                    if ((finished & 0x3FF) == 0)
+                        progress_ = static_cast<float>(finished) / current.size();
+                } }));
+        }
+        for (auto &f : futs)
+            f.get();
+
+        std::vector<uintptr_t> merged;
+        for (auto &hits : threadHits)
+        {
+            merged.insert(merged.end(), hits.begin(), hits.end());
+        }
+        std::sort(merged.begin(), merged.end());
+        merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
+
+        std::unique_lock lock(mutex_);
+        addedList_.swap(merged);
+        setBits_ = 0;
+    }
+
 public:
     MemScanner() = default;
     ~MemScanner() = default; // RAII handles cleanup
@@ -1207,6 +1386,29 @@ public:
         {
             scanNext<T>(target, mode);
         }
+    }
+
+    void scanString(pid_t /*pid*/, const std::string &needle, bool isFirst)
+    {
+        if (scanning_.exchange(true))
+            return;
+
+        struct Guard
+        {
+            std::atomic<bool> &s;
+            std::atomic<float> &p;
+            ~Guard()
+            {
+                s = false;
+                p = 1.0f;
+            }
+        } guard{scanning_, progress_};
+
+        progress_ = 0.0f;
+        if (isFirst)
+            scanFirstString(needle);
+        else
+            scanNextString(needle);
     }
 };
 
@@ -2909,6 +3111,8 @@ namespace
             return Types::FuzzyMode::Range;
         if (t == "ptr" || t == "pointer")
             return Types::FuzzyMode::Pointer;
+        if (t == "str" || t == "string")
+            return Types::FuzzyMode::String;
         return std::nullopt;
     }
 
@@ -2918,8 +3122,6 @@ namespace
         const std::string t = toLowerAscii(token);
         if (t == "hex")
             return Types::ViewFormat::Hex;
-        if (t == "hex16")
-            return Types::ViewFormat::Hex16;
         if (t == "hex64")
             return Types::ViewFormat::Hex64;
         if (t == "i8" || t == "int8")
@@ -2974,8 +3176,6 @@ namespace
         {
         case Types::ViewFormat::Hex:
             return "hex";
-        case Types::ViewFormat::Hex16:
-            return "hex16";
         case Types::ViewFormat::Hex64:
             return "hex64";
         case Types::ViewFormat::I8:
@@ -3803,7 +4003,7 @@ namespace
             const auto fuzzyMode = parseFuzzyModeToken(tokens[2]);
             if (!fuzzyMode.has_value())
             {
-                return err("mode 无效，支持: unknown/eq/gt/lt/inc/dec/changed/unchanged/range/pointer");
+                return err("mode 无效，支持: unknown/eq/gt/lt/inc/dec/changed/unchanged/range/pointer/string");
             }
 
             const bool isFirst = (command == "scan.first");
@@ -3811,6 +4011,20 @@ namespace
             if (pid <= 0)
             {
                 return err("全局PID未设置，请先执行 pid.set 或 pid.attach");
+            }
+
+            if (*fuzzyMode == Types::FuzzyMode::String)
+            {
+                if (tokens.size() < 4)
+                {
+                    return err("string 模式需要 value 参数");
+                }
+                const std::string needle = joinTokens(tokens, 3);
+                session->memScanner.scanString(pid, needle, isFirst);
+                return ok(std::format("count={} progress={:.4f} scanning={}",
+                                      session->memScanner.count(),
+                                      session->memScanner.progress(),
+                                      session->memScanner.isScanning() ? 1 : 0));
             }
 
             const bool needValue = (*fuzzyMode != Types::FuzzyMode::Unknown);
@@ -3875,8 +4089,10 @@ namespace
 
             const auto start = parseUInt64(tokens[1]);
             const auto count = parseUInt64(tokens[2]);
+            const std::string typeToken = toLowerAscii(tokens[3]);
+            const bool stringType = (typeToken == "str" || typeToken == "string" || typeToken == "text");
             const auto dataType = parseDataTypeToken(tokens[3]);
-            if (!start.has_value() || !count.has_value() || !dataType.has_value())
+            if (!start.has_value() || !count.has_value() || (!stringType && !dataType.has_value()))
             {
                 return err("参数无效");
             }
@@ -3900,7 +4116,7 @@ namespace
                 payload["items"].push_back({
                     {"addr", static_cast<std::uint64_t>(addr)},
                     {"addr_hex", std::format("0x{:X}", static_cast<std::uint64_t>(addr))},
-                    {"value", MemUtils::ReadAsString(addr, *dataType)},
+                    {"value", stringType ? MemUtils::ReadAsText(addr) : MemUtils::ReadAsString(addr, *dataType)},
                 });
             }
 
@@ -3926,7 +4142,7 @@ namespace
                 const auto format = parseViewFormatToken(tokens[2]);
                 if (!format.has_value())
                 {
-                    return err("format 无效，支持: hex/hex16/hex64/i8/i16/i32/i64/f32/f64/disasm");
+                    return err("format 无效，支持: hex/hex64/i8/i16/i32/i64/f32/f64/disasm");
                 }
                 session->memViewer.setFormat(*format);
             }
@@ -3999,7 +4215,7 @@ namespace
             const auto format = parseViewFormatToken(tokens[1]);
             if (!format.has_value())
             {
-                return err("format 无效，支持: hex/hex16/hex64/i8/i16/i32/i64/f32/f64/disasm");
+                return err("format 无效，支持: hex/hex64/i8/i16/i32/i64/f32/f64/disasm");
             }
 
             session->memViewer.setFormat(*format);
@@ -4752,7 +4968,9 @@ namespace
             }
 
             const std::string rangeMax = optionalString("range_max");
-            if (!rangeMax.empty())
+            const std::string modeLower = toLowerAscii(modeValue);
+            const bool isStringMode = (modeLower == "string" || modeLower == "str");
+            if (!rangeMax.empty() && !isStringMode)
             {
                 if (modeValue == "unknown")
                 {
