@@ -455,12 +455,12 @@ static inline int walk_translate_va_to_pa(struct mm_struct *mm, uint64_t vaddr, 
         return -1;
 
     //  PTE Level (普通的 4KB 页)
-    ptep = pte_offset_map(pmd, vaddr);
+    // 较新内核中 __pte_offset_map 不导出，对于 64位 系统直接使用 pte_offset_kernel 即可
+    ptep = pte_offset_kernel(pmd, vaddr);
     if (unlikely(!ptep))
         return -1;
 
-    pte = *ptep;     // 原子读取 PTE 内容到栈上
-    pte_unmap(ptep); // 立即释放映射
+    pte = *ptep;
 
     // 必须检查 pte_present，因为页可能被换出到 Swap 分区
     // 如果 present 为 false，pfn 字段是无效的（存的是 swap offset）
