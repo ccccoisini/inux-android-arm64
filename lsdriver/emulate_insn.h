@@ -208,7 +208,7 @@ static bool emulate_insn(struct pt_regs *regs)
         if ((insn & 0x3A000000) == 0x28000000)
         {
             u32 opc_pair = (insn >> 30) & 0x3, l = (insn >> 22) & 1;
-            u32 idx = (insn >> 23) & 0x3; // 【修复】ARMv8: 1=post, 2=signed, 3=pre
+            u32 idx = (insn >> 23) & 0x3; // ARMv8: 1=post, 2=signed, 3=pre
             u32 rn = (insn >> 5) & 0x1F, rt = insn & 0x1F, rt2 = (insn >> 10) & 0x1F;
 
             int pair_bytes = (opc_pair == 2) ? 8 : 4;
@@ -279,7 +279,7 @@ static bool emulate_insn(struct pt_regs *regs)
             u32 rn = (insn >> 5) & 0x1F, rt = insn & 0x1F;
             u32 opc = (insn >> 22) & 0x3;
 
-            // 【修复关键点 1】：opc 不为 0 才是 Load！
+            // opc 不为 0 才是 Load！
             bool is_load = (opc != 0);
             bool sign_ext = (opc == 2) || (opc == 3);
             bool dest_64 = (size == 3) || (opc == 2);
